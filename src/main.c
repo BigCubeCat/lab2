@@ -1,129 +1,80 @@
+#include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
 
-#include "controller.h"
 #include "encoder.h"
 
+#include "hardware/pio.h"
 #include "hardware/pwm.h"
-#include "output/font.h"
-#include "output/led_matrix.h"
-#include "output/oled.h"
 #include "pico/stdlib.h"
 
-#define ENC_S1          6
-#define ENC_S2          7
-#define ENC_KEY         8
+#define LED_PIN            12U
+#define ENCODER_S1_PIN     6U
+#define ENCODER_KEY_PIN    8U
+#define PWM_TOP            255U
+#define BRIGHTNESS_STEP    10
+#define INITIAL_BRIGHTNESS 50
 
-#define PWM_TOP         100
-#define BRIGHTNESS_STEP 10
+static int brightness = INITIAL_BRIGHTNESS;
+static uint pwm_slice;
 
-#define OLED_POWER      12
+static void set_brightness(int value) {
+    if (value < 0) {
+        value = 0;
+    }
+    else if (value > 100) {
+        value = 100;
+    }
 
-#define BRIGHTNESS_Y    20
-#define TEXT_X          10
-#define TEXT_Y          30
-
-
-static void draw_data() {
-    oled_clear();
-    TColorController *c = color_controller();
-    uint8_t current     = c->current;
-    char str[128];
-    snprintf(
-        str, sizeof(str), "h s v=%d %d %d", c->color.h, c->color.s, c->color.v
+    brightness = value;
+    pwm_set_chan_level(
+        pwm_slice,
+        pwm_gpio_to_channel(LED_PIN),
+        (uint16_t)((brightness * (int)PWM_TOP) / 100)
     );
-    if (current == 0) {
-        str[0] = 'H';
-    }
-    else if (current == 1) {
-        str[2] = 'S';
-    }
-    else if (current == 2) {
-        str[4] = 'V';
-    }
-    font_draw_text(1, 0, str);
-    bool use_cos = (c->use_cos != 0);
-    snprintf(str, sizeof(str), "use cos: %c", use_cos ? 'Y' : 'N');
-    if (current == 3) {
-        str[0] = 'U';
-    }
-    font_draw_text(1, 16, str);
-    if (!use_cos) {
-        return;
-    }
-    snprintf(str, sizeof(str), "k: %.2f", c->k);
-    if (current == 4) {
-        str[0] = 'K';
-    }
-    font_draw_text(10, 32, str);
-    snprintf(str, sizeof(str), "cos(k*%c)", mode2char(c->mode));
-    if (current == 5) {
-        str[0] = 'C';
-    }
-    font_draw_text(10, 48, str);
 }
 
+static void init_led_pwm(void) {
+    pwm_config config;
+
+    gpio_set_function(LED_PIN, GPIO_FUNC_PWM);
+    pwm_slice = pwm_gpio_to_slice_num(LED_PIN);
+
+    config = pwm_get_default_config();
+    pwm_config_set_wrap(&config, PWM_TOP);
+    pwm_config_set_clkdiv(&config, 4.0f);
+    pwm_init(pwm_slice, &config, true);
+
+    set_brightness(brightness);
+}
 
 int main(void) {
-    init_encoder(ENC_S1, ENC_S2, ENC_KEY);
+    encoder_t encoder = { 0 };
 
-    TEncoderState *encoder = get_encoder();
+    stdio_init_all();
+    init_led_pwm();
 
-    gpio_init(OLED_POWER);
-    gpio_set_dir(OLED_POWER, GPIO_OUT);
-    gpio_put(OLED_POWER, 1);
-
-    bool enabled      = true;
-    bool screen_dirty = true;
-
-    TColorController *color = color_controller();
-    color->color            = hsv(0, 90, 90);
-
-    oled_init();
-    led_matrix_init();
-
-    RGB_t initial_rgb = hsv2rgb(color->color);
-    led_matrix_fill(initial_rgb.r, initial_rgb.g, initial_rgb.b);
-    led_matrix_show();
-
-    draw_data();
-    oled_update();
-
+    if (!encoder_init(&encoder, ENCODER_S1_PIN, ENCODER_KEY_PIN, pio0, 0U)) {
+        /* Initialization failed, for example because PIO0 instruction address
+           zero or state machine 0 is already in use. */
+        while (true) {
+            tight_loop_contents();
+        }
+    }
 
     while (true) {
-        process_state();
-
-        if (encoder->key_pressed) {
-            color_controller_next();
-            screen_dirty = true;
+        const int delta = encoder_get_delta(&encoder);
+        if (delta != 0) {
+            set_brightness(brightness + delta * BRIGHTNESS_STEP);
         }
 
-        if (encoder->direction != 0) {
-            color_controller_change(encoder->direction);
-            screen_dirty = true;
+        if (encoder_was_pressed(&encoder)) {
+            set_brightness(INITIAL_BRIGHTNESS);
         }
 
-        if (color->use_cos) {
-            color_controller_update_cos();
-            screen_dirty = true;
-        }
-
-        if (screen_dirty) {
-            RGB_t color_rgb = hsv2rgb(color->color);
-
-            if (enabled)
-                led_matrix_fill(color_rgb.r, color_rgb.g, color_rgb.b);
-            else
-                led_matrix_fill(0, 0, 0);
-
-            led_matrix_show();
-
-            draw_data();
-            oled_update();
-
-            screen_dirty = false;
-        }
-
-        sleep_ms(10);
+        sleep_ms(1);
     }
+
+    /* Unreachable in this example, but keeps the teardown API demonstrated. */
+    encoder_deinit(&encoder);
+    return 0;
 }

@@ -1,84 +1,167 @@
 #include "encoder.h"
 
-#include <hardware/gpio.h>
+#include <string.h>
 
-TEncoderState *get_encoder() {
-    static TEncoderState state;
-    return &state;
+#include "encoder.pio.h"
+
+#include "hardware/gpio.h"
+#include "hardware/pio.h"
+#include "pico/stdlib.h"
+
+static int32_t encoder_read_count(encoder_t *encoder) {
+    uint32_t value = 0;
+    int remaining;
+
+    if (encoder == NULL || !encoder->initialized) {
+        return 0;
+    }
+
+    /* Drain queued snapshots and then read one fresh snapshot, as in the
+       official Pico quadrature encoder example. */
+    remaining = (int)pio_sm_get_rx_fifo_level(encoder->pio, encoder->sm) + 1;
+    while (remaining > 0) {
+        value = pio_sm_get_blocking(encoder->pio, encoder->sm);
+        --remaining;
+    }
+
+    return (int32_t)value;
 }
 
-void setup_gpio(int gpio) {
-    gpio_init(gpio);
-    gpio_set_dir(gpio, GPIO_IN);
-    gpio_pull_up(gpio);
+bool encoder_init(
+    encoder_t *encoder, uint pin_a, uint key_pin, PIO pio, uint sm
+) {
+    pio_sm_config config;
+
+    if (encoder == NULL || pio == NULL || sm >= 4U || pin_a > 28U
+        || key_pin > 29U || key_pin == pin_a || key_pin == pin_a + 1U) {
+        return false;
+    }
+
+    memset(encoder, 0, sizeof(*encoder));
+
+    /* The PIO program uses computed jumps, so it must occupy address zero.
+       Do not silently overwrite another program at that location. */
+    if (pio_sm_is_claimed(pio, sm)
+        || !pio_can_add_program_at_offset(
+            pio, &quadrature_encoder_program, 0U
+        )) {
+        return false;
+    }
+
+    pio_sm_claim(pio, sm);
+    encoder->offset =
+        pio_add_program_at_offset(pio, &quadrature_encoder_program, 0U);
+    encoder->pio     = pio;
+    encoder->sm      = sm;
+    encoder->pin_a   = pin_a;
+    encoder->key_pin = key_pin;
+
+    /* S1 and S2 must be adjacent GPIOs because the PIO program reads 2 pins. */
+    pio_gpio_init(pio, pin_a);
+    pio_gpio_init(pio, pin_a + 1U);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_a, 2U, false);
+    gpio_pull_up(pin_a);
+    gpio_pull_up(pin_a + 1U);
+
+    /* KEY is a separate active-low GPIO button. */
+    gpio_init(key_pin);
+    gpio_set_dir(key_pin, GPIO_IN);
+    gpio_pull_up(key_pin);
+
+    config = quadrature_encoder_program_get_default_config(encoder->offset);
+    sm_config_set_in_pins(&config, pin_a);
+    sm_config_set_jmp_pin(&config, pin_a);
+    sm_config_set_in_shift(&config, false, false, 32U);
+    sm_config_set_fifo_join(&config, PIO_FIFO_JOIN_NONE);
+    sm_config_set_clkdiv(&config, 1.0f);
+
+    pio_sm_init(pio, sm, encoder->offset, &config);
+    encoder->initialized = true;
+    pio_sm_set_enabled(pio, sm, true);
+
+    /* Synchronize software accounting with the current PIO counter. */
+    encoder->last_count    = encoder_read_count(encoder);
+    encoder->partial_steps = 0;
+
+    encoder->button_candidate  = !gpio_get(key_pin);
+    encoder->button_stable     = encoder->button_candidate;
+    encoder->pressed_event     = false;
+    encoder->button_changed_ms = to_ms_since_boot(get_absolute_time());
+
+    return true;
 }
 
-void init_encoder(int gpio_s1, int gpio_s2, int gpio_key) {
-    TEncoderState *state = get_encoder();
+void encoder_deinit(encoder_t *encoder) {
+    if (encoder == NULL || !encoder->initialized) {
+        return;
+    }
 
-    state->direction   = 0;
-    state->key_pressed = false;
-
-    state->gpio_key = gpio_key;
-    state->gpio_s1  = gpio_s1;
-    state->gpio_s2  = gpio_s2;
-
-    setup_gpio(state->gpio_key);
-    setup_gpio(state->gpio_s1);
-    setup_gpio(state->gpio_s2);
-
-    state->states.delta = 0;
-
-    state->states.prev =
-        (gpio_get(state->gpio_s1) << 1) | gpio_get(state->gpio_s2);
+    pio_sm_set_enabled(encoder->pio, encoder->sm, false);
+    pio_sm_unclaim(encoder->pio, encoder->sm);
+    pio_remove_program(
+        encoder->pio, &quadrature_encoder_program, encoder->offset
+    );
+    encoder->initialized = false;
 }
 
-void process_state() {
-    TEncoderState *state = get_encoder();
+int encoder_get_delta(encoder_t *encoder) {
+    int32_t current;
+    int32_t delta;
+    int detents = 0;
 
-    state->direction   = 0;
-    state->key_pressed = false;
+    if (encoder == NULL || !encoder->initialized) {
+        return 0;
+    }
 
-    state->states.next =
-        (gpio_get(state->gpio_s1) << 1) | gpio_get(state->gpio_s2);
+    current = encoder_read_count(encoder);
+    /* Unsigned subtraction gives the intended modulo-2^32 difference when
+       the PIO's 32-bit counter wraps around. */
+    delta = (int32_t)((uint32_t)current - (uint32_t)encoder->last_count);
+    encoder->last_count = current;
+    encoder->partial_steps += delta;
 
-    if (state->states.next != state->states.prev) {
-        if ((state->states.prev == 0b00 && state->states.next == 0b01)
-            || (state->states.prev == 0b01 && state->states.next == 0b11)
-            || (state->states.prev == 0b11 && state->states.next == 0b10)
-            || (state->states.prev == 0b10 && state->states.next == 0b00)) {
-            state->states.delta++;
-        }
-        else if (
-            (state->states.prev == 0b00 && state->states.next == 0b10)
-            || (state->states.prev == 0b10 && state->states.next == 0b11)
-            || (state->states.prev == 0b11 && state->states.next == 0b01)
-            || (state->states.prev == 0b01 && state->states.next == 0b00)
-        ) {
-            state->states.delta--;
-        }
+    /* A common mechanical encoder has four quadrature transitions per click. */
+    while (encoder->partial_steps >= 4) {
+        ++detents;
+        encoder->partial_steps -= 4;
+    }
+    while (encoder->partial_steps <= -4) {
+        --detents;
+        encoder->partial_steps += 4;
+    }
 
-        state->states.prev = state->states.next;
-        // Полный щелчок энкодера
-        if (state->states.delta >= 4) {
-            state->states.delta = 0;
-            state->direction    = -1;
-        }
-        else if (state->states.delta <= -4) {
-            state->states.delta = 0;
-            state->direction    = 1;
+    return detents;
+}
+
+bool encoder_was_pressed(encoder_t *encoder) {
+    const uint32_t debounce_ms = 25U;
+    uint32_t now;
+    bool raw_pressed;
+
+    if (encoder == NULL || !encoder->initialized) {
+        return false;
+    }
+
+    now         = to_ms_since_boot(get_absolute_time());
+    raw_pressed = !gpio_get(encoder->key_pin);
+
+    if (raw_pressed != encoder->button_candidate) {
+        encoder->button_candidate  = raw_pressed;
+        encoder->button_changed_ms = now;
+    }
+
+    if ((uint32_t)(now - encoder->button_changed_ms) >= debounce_ms
+        && encoder->button_stable != encoder->button_candidate) {
+        encoder->button_stable = encoder->button_candidate;
+        if (encoder->button_stable) {
+            encoder->pressed_event = true;
         }
     }
 
-    // Кнопка:
-    // 1 = отпущена
-    // 0 = нажата
-    static bool previous_key = true;
-
-    bool current_key = gpio_get(state->gpio_key);
-    // Событие только на переходе 1 -> 0
-    if (previous_key && !current_key) {
-        state->key_pressed = true;
+    if (encoder->pressed_event) {
+        encoder->pressed_event = false;
+        return true;
     }
-    previous_key = current_key;
+
+    return false;
 }

@@ -9,8 +9,8 @@
 
 #define OLED_I2C          i2c1
 
-#define OLED_SDA          10
-#define OLED_SCL          11
+#define OLED_SDA          17
+#define OLED_SCL          16
 
 #define OLED_ADDRESS      0x3C
 

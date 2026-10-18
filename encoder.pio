@@ -1,0 +1,59 @@
+;
+; Quadrature decoder for a rotary encoder using two adjacent GPIO pins.
+; Based on Raspberry Pi pico-examples, quadrature_encoder.pio.
+; SPDX-License-Identifier: BSD-3-Clause
+;
+.pio_version 0
+.program quadrature_encoder
+.origin 0
+
+; Computed-jump table. The program MUST be loaded at instruction address 0.
+; The previous pin state is in OSR[1:0], the current state is sampled into
+; ISR[1:0]. Their combination forms a 4-bit index into this jump table.
+
+; Previous state 00
+    jmp update       ; current 00
+    jmp decrement    ; current 01
+    jmp increment    ; current 10
+    jmp update       ; current 11
+
+; Previous state 01
+    jmp increment    ; current 00
+    jmp update       ; current 01
+    jmp update       ; current 10
+    jmp decrement    ; current 11
+
+; Previous state 10
+    jmp decrement    ; current 00
+    jmp update       ; current 01
+    jmp update       ; current 10
+    jmp increment    ; current 11
+
+; Previous state 11
+    jmp update       ; current 00
+    jmp increment    ; current 01
+
+; This instruction occupies computed-jump table entry 14.
+decrement:
+    jmp y--, update  ; decrement Y and continue at update
+
+.wrap_target
+update:
+    mov isr, y
+    push noblock
+
+    ; Append the newly sampled 2-bit GPIO state to the previous state.
+    out isr, 2
+    in pins, 2
+    mov osr, isr
+    mov pc, isr
+
+; Increment Y using invert/decrement/invert, since PIO has no INC instruction.
+increment:
+    mov y, ~y
+    jmp y--, increment_cont
+increment_cont:
+    mov y, ~y
+.wrap
+
+

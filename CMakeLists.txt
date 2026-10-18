@@ -25,10 +25,9 @@ add_executable(oled
     src/output/led_matrix.c
 )
 
-# Compile the PIO assembly into src/output/ws2812.pio.h
-# and make the generated header available to the target.
 pico_generate_pio_header(oled
     ${CMAKE_CURRENT_LIST_DIR}/src/output/ws2812.pio
+    ${CMAKE_CURRENT_LIST_DIR}/encoder.pio
 )
 
 target_link_libraries(oled
